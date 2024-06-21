@@ -9,8 +9,8 @@
 5. Add the following lines to your `yabairc` file (window rules are managed in y3):
 ```
 yabai -m rule --add app="$" manage=off
-yabai -m signal --add event=window_created action='y3 window_created $YABAI_WINDOW_ID'
-yabai -m signal --add event=window_focused action='y3 window_focused $YABAI_WINDOW_ID'
+yabai -m signal --add event=window_created action='y3 window-created $YABAI_WINDOW_ID'
+yabai -m signal --add event=window_focused action='y3 window-focused $YABAI_WINDOW_ID'
 ```
 
 ## Configuration
