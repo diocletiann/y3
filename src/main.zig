@@ -16,17 +16,19 @@ const Command = enum {
     focus,
     move,
     run,
-    window_created,
-    window_focused,
+    stop,
+    @"window-created",
+    @"window-focused",
     @"start-service",
     @"stop-service",
+    @"restart-service",
 };
 
-const Direction = enum {
-    north,
-    south,
-    east,
-    west,
+const Direction = enum(u8) {
+    north = 1,
+    south = 2,
+    east = 3,
+    west = 4,
 };
 
 const Domain = enum {
@@ -36,66 +38,63 @@ const Domain = enum {
     query,
 };
 
+var path_yabai: []const u8 = undefined;
+
 pub fn main() !void {
     var args = std.process.args();
     _ = args.skip();
-    const arg1 = args.next() orelse return log.err("Missing action argument.", .{});
-    const action = std.meta.stringToEnum(Command, arg1) orelse return log.err("Invalid action: {s}", .{arg1});
+    const arg1 = args.next() orelse return log.err("missing command argument.", .{});
+    const command = std.meta.stringToEnum(Command, arg1) orelse return log.err("invalid action: {s}", .{arg1});
+    const username = std.posix.getenv("USER") orelse return log.err("failed to get user name", .{});
+    var buf_path: [64]u8 = undefined;
+    const path_socket_y3 = try std.fmt.bufPrint(&buf_path, "/tmp/y3_{s}.socket", .{username});
 
-    const user_name = std.posix.getenv("USER") orelse return log.err("Failed to get user name", .{});
-    var buf: [64]u8 = undefined;
-    const path_socket_y3 = try std.fmt.bufPrint(&buf, "/tmp/y3_{s}.socket", .{user_name});
-
-    switch (action) {
-        .@"start-service" => try startService(user_name, path_socket_y3),
-        .@"stop-service" => try stopService(user_name, path_socket_y3),
-        .run => try init(path_socket_y3, user_name),
-        else => {
-            const arg2 = args.next() orelse return log.err("Missing direction argument.", .{});
-            const stream = try net.connectUnixSocket(path_socket_y3);
-            defer stream.close();
-
-            switch (action) {
-                .focus, .move => {
-                    const dir = std.meta.stringToEnum(Direction, arg2) orelse return log.err("Invalid direction: {s}.", .{arg2});
-                    try stream.writeAll(&.{ @intFromEnum(action), @intFromEnum(dir) });
-                },
-                .window_created, .window_focused => {
-                    const action_array: [1]u8 = .{@intFromEnum(action)};
-                    const id = std.fmt.parseUnsigned(u32, arg2, 10) catch |err| return log.err("Invalid window id: {s}; error: {}.", .{ arg2, err });
-                    const id_array: [4]u8 = @bitCast(id);
-                    try stream.writeAll(&action_array ++ id_array);
-                },
-                else => {},
-            }
+    var buf_cmd: [5]u8 = .{ @intFromEnum(command), 0, 0, 0, 0 };
+    switch (command) {
+        .focus, .move => {
+            const arg2 = args.next() orelse return log.err("missing direction argument", .{});
+            const dir = std.meta.stringToEnum(Direction, arg2) orelse return log.err("invalid direction: {s}", .{arg2});
+            buf_cmd[1] = @intFromEnum(dir);
         },
+        .@"window-focused", .@"window-created" => {
+            const arg2 = args.next() orelse return log.err("missing window ID argument.", .{});
+            const id = std.fmt.parseUnsigned(u32, arg2, 10) catch |err| return log.err("invalid window id '{s}': {s}", .{ arg2, @errorName(err) });
+            buf_cmd[1..].* = @bitCast(id);
+        },
+        .@"start-service" => return startService(username, path_socket_y3) catch |err| log.err("failed to start service: {s}", .{@errorName(err)}),
+        .@"stop-service" => return stopService(username, path_socket_y3) catch |err| log.err("failed to stop service: {s}", .{@errorName(err)}),
+        .@"restart-service" => return restartService(username, path_socket_y3) catch |err| log.err("failed to restart service: {s}", .{@errorName(err)}),
+        .run => return init(path_socket_y3, username) catch |err| log.err("failed to init y3 service: {s}", .{@errorName(err)}),
+        .stop => {},
     }
+    const stream = net.connectUnixSocket(path_socket_y3) catch |err| return log.err("failed to connect to y3 socket: {s}", .{@errorName(err)});
+    defer stream.close();
+    try stream.writeAll(&buf_cmd);
 }
 
-var path_yabai: []const u8 = undefined;
-
-fn init(path_socket_y3: []const u8, user_name: []const u8) !void {
+fn init(path_socket_y3: []const u8, username: []const u8) !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const gpa_alloc = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
 
     if (net.connectUnixSocket(path_socket_y3) catch null) |s| {
         s.close();
-        return log.err("y3 is already running, exiting...", .{});
+        return log.err("y3 is already running, exiting", .{});
     }
-    path_yabai = try std.fmt.allocPrint(gpa_alloc, "/tmp/yabai_{s}.socket", .{user_name});
+    path_yabai = try std.fmt.allocPrint(gpa_alloc, "/tmp/yabai_{s}.socket", .{username});
+    defer gpa_alloc.free(path_yabai);
 
     if (net.connectUnixSocket(path_yabai)) |s| {
         s.close();
     } else |err| {
         std.time.sleep(std.time.ns_per_s);
-        log.err("Failed to connect to yabai socket. Check if yabai is running.", .{});
+        log.err("failed to connect to yabai socket, check if yabai is running", .{});
         return err;
     }
     const addr_socket = try net.Address.initUnix(path_socket_y3);
     var server = try addr_socket.listen(.{});
-    print("started listener...\n", .{});
     defer server.deinit();
+    print("started listener...\n", .{});
 
     var arena = ArenaAllocator.init(gpa_alloc);
     defer arena.deinit();
@@ -128,58 +127,52 @@ fn init(path_socket_y3: []const u8, user_name: []const u8) !void {
         }
     }
     _ = arena.reset(.free_all);
-
-    const config = Config.load(gpa_alloc, user_name) catch |err| switch (err) {
-        error.FileNotFound => return log.err("Could not find configuration file, check if ~/.config/y3/config.json exists.", .{}),
-        else => return err,
-    };
+    const config = Config.load(gpa_alloc, username) catch |err| return log.err("failed to load configuration: {s}", .{@errorName(err)});
+    defer config.deinit();
     coreLoop(&arena, &server, &config.value, id_win_focused);
 }
 
 fn coreLoop(arena: *ArenaAllocator, server: *net.Server, config: *const Config, id_win_focused_arg: ?u32) void {
     var id_win_focused: ?u32 = id_win_focused_arg;
     var id_win_other: ?u32 = null;
-    var cmd: [5]u8 = undefined;
-
+    var buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
     while (true) {
         defer _ = arena.reset(.{ .retain_with_limit = 1024 * 16 });
         const conn = server.accept() catch |err| {
-            log.err("Connection accept failed: {}\n", .{err});
+            log.err("failed to accept socket connection: {s}", .{@errorName(err)});
             continue;
         };
         defer conn.stream.close();
 
-        _ = conn.stream.readAll(&cmd) catch |err| {
-            log.err("Stream read failed: {}\n", .{err});
+        _ = conn.stream.readAll(&buf) catch |err| {
+            log.err("failed to read socket stream: {s}", .{@errorName(err)});
             continue;
         };
-        const command: Command = @enumFromInt(cmd[0]);
-        _ = switch (command) {
-            .focus => focusWindow(@enumFromInt(cmd[1])),
-            .move => move(arena, @enumFromInt(cmd[1])),
-            .window_created => windowCreated(arena, config, id_win_focused, id_win_other, @bitCast(cmd[1..].*)),
-            .window_focused => {
+        const command: Command = @enumFromInt(buf[0]);
+        switch (command) {
+            .focus => {
+                const dir: Direction = @enumFromInt(buf[1]);
+                focusWindow(dir) catch |err| log.err("failed to 'focus window {s}': {s}", .{ @tagName(dir), @errorName(err) });
+            },
+            .move => {
+                const dir: Direction = @enumFromInt(buf[1]);
+                moveWindow(dir, arena) catch |err| log.err("failed to 'move window {s}': {s}", .{ @tagName(dir), @errorName(err) });
+            },
+            .@"window-created" => {
+                const id_win_created: u32 = @bitCast(buf[1..].*);
+                placeWindow(id_win_created, id_win_focused, id_win_other, config, arena) catch |err|
+                    log.err("failed to place created window {}: {s}", .{ id_win_created, @errorName(err) });
+            },
+            .@"window-focused" => {
                 id_win_other = id_win_focused;
-                id_win_focused = @bitCast(cmd[1..].*);
+                id_win_focused = @bitCast(buf[1..].*);
             },
-            else => return,
-        } catch |err| {
-            log.err("Command '{s} {s}' failed: {}", .{ @tagName(command), cmd[1..], err });
-            if (builtin.mode == .Debug) std.debug.dumpStackTrace(@errorReturnTrace().?.*);
-        };
-        if (builtin.mode == .Debug) switch (command) {
-            .focus, .move => {
-                const dir: Direction = @enumFromInt(cmd[1]);
-                log.debug("command received: {} {}", .{ command, dir });
-            },
-            .window_created, .window_focused => {
-                const id: u32 = @bitCast(cmd[1..].*);
-                log.debug("command received: {} {}", .{ command, id });
-            },
-            else => return,
-        };
-        log.debug("arena capacity: {}\n", .{arena.queryCapacity()});
-        // print("\n", .{});
+            .stop => break,
+            else => log.err("unsupported command sent to y3 server: {s}", .{@tagName(command)}),
+        }
+        if (builtin.mode == .Debug)
+            if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
+        // log.debug("arena capacity: {}", .{arena.queryCapacity()});
     }
 }
 
@@ -188,25 +181,20 @@ const Config = struct {
     layout: enum { bsp, manual, two_columns },
     placement: enum { focused_window, other_window },
 
-    fn load(gpa: Allocator, user_name: []const u8) !std.json.Parsed(Config) {
-        const path = try std.fs.path.join(gpa, &.{ "/Users", user_name, ".config", "y3", "config.json" });
+    fn load(gpa: Allocator, username: []const u8) !std.json.Parsed(Config) {
+        const path = try std.fs.path.join(gpa, &.{ "/Users", username, ".config", "y3", "config.json" });
         defer gpa.free(path);
-
-        const file = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
+        const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch |err| {
+            if (err == error.FileNotFound) log.err("failed to open {s}", .{path});
+            return err;
+        };
         const data = try file.readToEndAlloc(gpa, 1024);
         defer gpa.free(data);
-
         return std.json.parseFromSlice(Config, gpa, data, .{ .allocate = .alloc_always });
     }
 };
 
-fn windowCreated(
-    arena: *ArenaAllocator,
-    config: *const Config,
-    id_win_focused: ?u32,
-    id_win_other: ?u32,
-    id_win_created: u32,
-) !void {
+fn placeWindow(id_win_created: u32, id_win_focused: ?u32, id_win_other: ?u32, config: *const Config, arena: *ArenaAllocator) !void {
     const WindowLocal = struct {
         app: []const u8,
         title: []const u8,
@@ -265,17 +253,23 @@ fn focusWindowInDisplay(dir_input: Direction) !void {
         .west, .north => "last",
     };
     // TODO: test with 3 displays
-    focus(.window, target) catch |err| log.err("selectInDisplay failed, input: {}, {}", .{ dir_input, err });
+    focus(.window, target) catch |err| log.err("failed to selectInDisplay, input: {}, {}", .{ dir_input, err });
 }
 
 fn focusWindowInStack(dir_input: Direction) !void {
     switch (dir_input) {
         .north => focus(.window, "stack.prev") catch |err| switch (err) {
-            error.StackedPrev => focus(.window, "stack.last") catch |err2| if (err2 != error.StackedLast) return err2,
+            error.StackedPrev => focus(.window, "stack.last") catch |err2| switch (err2) {
+                error.StackedLast => {},
+                else => |e| return e,
+            },
             else => return err,
         },
         .south => focus(.window, "stack.next") catch |err| switch (err) {
-            error.StackedNext => focus(.window, "stack.first") catch |err2| if (err2 != error.StackedFirst) return err2,
+            error.StackedNext => focus(.window, "stack.first") catch |err2| switch (err2) {
+                error.StackedFirst => {},
+                else => |e| return e,
+            },
             else => return err,
         },
         else => {},
@@ -286,7 +280,7 @@ inline fn match(a: i16, b: i16) bool {
     return @abs(a - b) < 3;
 }
 
-fn move(arena: *ArenaAllocator, dir_input: Direction) !void {
+fn moveWindow(dir_input: Direction, arena: *ArenaAllocator) !void {
     const windows = try query(arena, []Window, .windows, .{"--space"});
     const win: *const Window = for (windows) |*w| {
         if (w.@"has-focus") break w;
@@ -364,10 +358,6 @@ fn move(arena: *ArenaAllocator, dir_input: Direction) !void {
     }
 }
 
-fn Neighbors(reference: enum { focused, north, south, east, west }) type {
-    _ = reference; // autofix
-}
-
 fn moveToDisplay(arena: *ArenaAllocator, dir_input: Direction) !void {
     const Space = struct {
         @"first-window": u32,
@@ -408,7 +398,7 @@ fn focus(comptime domain: Domain, target: anytype) !void {
 
 fn stackFocus(id_source: u32, target: anytype) !void {
     try yabai(.window, .{ target, "--stack", id_source });
-    try focus(.window, id_source);
+    try yabai(.window, .{ "--focus", id_source });
 }
 
 fn unstackFocus(id_win: u32, dir_unstack: Direction) !void {
@@ -426,7 +416,12 @@ fn float(id_win: u32) !void {
     try yabai(.window, .{ id_win, "--toggle", "float" });
 }
 
-fn query(arena: *ArenaAllocator, comptime Parsed: type, comptime cmd: enum { displays, spaces, windows }, args: anytype) !Parsed {
+fn query(
+    arena: *ArenaAllocator,
+    comptime Parsed: type,
+    comptime cmd: enum { displays, spaces, windows },
+    args: anytype,
+) !Parsed {
     const fields = std.meta.fields(switch (@typeInfo(Parsed)) {
         .Struct => Parsed,
         .Pointer => |p| switch (@typeInfo(p.child)) {
@@ -449,12 +444,10 @@ fn query(arena: *ArenaAllocator, comptime Parsed: type, comptime cmd: enum { dis
     defer stream.close();
     const arena_alloc = arena.allocator();
     const buf = try stream.reader().readAllAlloc(arena_alloc, 8192);
-
     var parsed = std.json.parseFromSliceLeaky(Parsed, arena_alloc, buf, .{ .ignore_unknown_fields = true }) catch |err| {
         try findSendError(buf);
         return err;
     };
-
     if (@hasField(Parsed, "frame")) {
         if (@hasField(FieldType(Parsed, .frame), "x2") and @hasField(FieldType(Parsed, .frame), "y2")) {
             parsed.frame.x2 = parsed.frame.x + parsed.frame.w;
@@ -497,6 +490,7 @@ fn yabaiUnchecked(comptime domain: Domain, args: anytype) !net.Stream {
     const data = buf.slice();
     data[0] = @intCast(buf.len - 4);
     const stream = try net.connectUnixSocket(path_yabai);
+    errdefer stream.close();
     try stream.writeAll(data);
     return stream;
 }
@@ -509,9 +503,10 @@ fn checkStreamError(stream: net.Stream) !void {
 
 inline fn findSendError(buf: []const u8) !void {
     if (buf[0] == 7) return error_map.get(buf[1 .. buf.len - 1]) orelse {
-        defer log.err("yabai message: {s}", .{buf[1 .. buf.len - 1]});
+        defer log.err("{s} [yabai reply]", .{buf[1 .. buf.len - 1]});
         if (std.mem.indexOf(u8, buf, "unknown command")) |_| return error.UnknownCommand;
         if (std.mem.indexOf(u8, buf, "unknown option")) |_| return error.UnknownOption;
+        if (std.mem.indexOf(u8, buf, "could not locate window with the specified id")) |_| return error.WindowID;
         return error.UnsupportedError;
     };
 }
@@ -535,7 +530,6 @@ const Window = struct {
     fn matches(self: *const Window, other: Window.Frame) bool {
         return @abs(self.frame.w - other.w) < margin and @abs(self.frame.h - other.h) < margin;
     }
-
     // TODO: test on multiple displays
     fn isFullHeight(self: *const Window, windows: []const Window, dir_input: Direction) bool {
         const win_north = self.neighbor(.north, windows, dir_input);
@@ -602,40 +596,47 @@ const Window = struct {
     }
 };
 
-fn startService(user_name: []const u8, path_socket: []const u8) !void {
-    if (builtin.mode == .Debug) return log.err("Installing a debug build as a service is not supported.", .{});
+fn startService(username: []const u8, path_socket: []const u8) !void {
     if (net.connectUnixSocket(path_socket) catch null) |s| {
         s.close();
         return log.info("y3 is already running, exiting...", .{});
     }
-    fs.deleteFileAbsolute(path_socket) catch |err| if (err != error.FileNotFound) return err; // TODO
-
+    fs.deleteFileAbsolute(path_socket) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
     const gpa = std.heap.c_allocator;
-    const agent_path = try fs.path.join(gpa, &.{ "/Users", user_name, "Library", "LaunchAgents", "y3.plist" });
+    const agent_path = try fs.path.join(gpa, &.{ "/Users", username, "Library", "LaunchAgents", "y3.plist" });
+    defer gpa.free(agent_path);
 
     _ = fs.openFileAbsolute(agent_path, .{ .mode = .read_only }) catch |err| switch (err) {
         error.FileNotFound => {
             const agent_file = try fs.createFileAbsolute(agent_path, .{});
             defer agent_file.close();
             try agent_file.writeAll(y3_plist);
-            log.info("y3 service installed...", .{});
+            log.info("installed y3 service: {s}", .{agent_path});
         },
-        else => return log.err("failed to open y3.plist: {}", .{err}),
+        else => return log.err("failed to open y3.plist: {s}", .{@errorName(err)}),
     };
     var proc = std.process.Child.init(&.{ "launchctl", "load", agent_path }, gpa);
     _ = try proc.spawnAndWait();
     log.info("y3 service loaded...", .{});
 }
 
-fn stopService(user_name: []const u8, path_socket: []const u8) !void {
+fn stopService(username: []const u8, path_socket: []const u8) !void {
     const gpa = std.heap.c_allocator;
-    const agent_path = try fs.path.join(gpa, &.{ "/Users", user_name, "Library", "LaunchAgents", "y3.plist" });
+    const path_agent = try fs.path.join(gpa, &.{ "/Users", username, "Library", "LaunchAgents", "y3.plist" });
+    defer gpa.free(path_agent);
 
-    var proc = std.process.Child.init(&.{ "launchctl", "unload", agent_path }, gpa);
+    var proc = std.process.Child.init(&.{ "launchctl", "unload", path_agent }, gpa);
     _ = try proc.spawnAndWait();
     log.info("y3 service unloaded...", .{});
     try fs.deleteFileAbsolute(path_socket);
-    std.posix.exit(0);
+}
+
+fn restartService(username: []const u8, path_socket: []const u8) !void {
+    try stopService(username, path_socket);
+    try startService(username, path_socket);
 }
 
 const error_map = std.StaticStringMap(YabaiError).initComptime(.{
