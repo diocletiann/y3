@@ -26,9 +26,9 @@ const Command = enum {
 
 const Direction = enum(u8) {
     north = 1,
-    south = 2,
-    east = 3,
-    west = 4,
+    south,
+    east,
+    west,
 };
 
 const Domain = enum {
@@ -64,7 +64,7 @@ pub fn main() !void {
         .@"start-service" => return startService(username, path_socket_y3) catch |err| log.err("failed to start service: {s}", .{@errorName(err)}),
         .@"stop-service" => return stopService(username, path_socket_y3) catch |err| log.err("failed to stop service: {s}", .{@errorName(err)}),
         .@"restart-service" => return restartService(username, path_socket_y3) catch |err| log.err("failed to restart service: {s}", .{@errorName(err)}),
-        .run => return init(path_socket_y3, username) catch |err| log.err("failed to init y3 service: {s}", .{@errorName(err)}),
+        .run => return init(path_socket_y3, username) catch |err| log.err("failed to launch y3 daemon: {s}", .{@errorName(err)}),
         .stop => {},
     }
     const stream = net.connectUnixSocket(path_socket_y3) catch |err| return log.err("failed to connect to y3 socket: {s}", .{@errorName(err)});
@@ -72,6 +72,54 @@ pub fn main() !void {
     try stream.writeAll(&buf_cmd);
 }
 
+fn startService(username: []const u8, path_socket: []const u8) !void {
+    if (net.connectUnixSocket(path_socket) catch null) |s| {
+        s.close();
+        return log.info("y3 is already running, exiting...", .{});
+    }
+    fs.deleteFileAbsolute(path_socket) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+    const gpa = std.heap.c_allocator;
+    const agent_path = try fs.path.join(gpa, &.{ "/Users", username, "Library", "LaunchAgents", "y3.plist" });
+    defer gpa.free(agent_path);
+
+    const agent_file = fs.openFileAbsolute(agent_path, .{ .mode = .read_only }) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            const file = try fs.createFileAbsolute(agent_path, .{});
+            errdefer file.close();
+            try file.writeAll(y3_plist);
+            log.info("y3 service installed: {s}", .{agent_path});
+            break :blk file;
+        },
+        else => {
+            log.err("failed to open {s}: {s}", .{ agent_path, @errorName(err) });
+            return err;
+        },
+    };
+    defer agent_file.close();
+
+    var proc = std.process.Child.init(&.{ "launchctl", "load", agent_path }, gpa);
+    _ = try proc.spawnAndWait();
+    log.info("y3 service loaded...", .{});
+}
+
+fn stopService(username: []const u8, path_socket: []const u8) !void {
+    const gpa = std.heap.c_allocator;
+    const path_agent = try fs.path.join(gpa, &.{ "/Users", username, "Library", "LaunchAgents", "y3.plist" });
+    defer gpa.free(path_agent);
+
+    var proc = std.process.Child.init(&.{ "launchctl", "unload", path_agent }, gpa);
+    _ = try proc.spawnAndWait();
+    log.info("y3 service unloaded...", .{});
+    try fs.deleteFileAbsolute(path_socket);
+}
+
+fn restartService(username: []const u8, path_socket: []const u8) !void {
+    try stopService(username, path_socket);
+    try startService(username, path_socket);
+}
 fn init(path_socket_y3: []const u8, username: []const u8) !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
@@ -302,8 +350,8 @@ fn moveWindow(dir_input: Direction, arena: *ArenaAllocator) !void {
         .west => win_west,
     }) |win_target| {
         log.debug("target window: {any}", .{win_target});
-        if (win_target.matches(win.frame)) return stackFocus(win.id, win_target.id);
 
+        if (win_target.matches(win.frame)) return stackFocus(win.id, win_target.id);
         return switch (dir_input) {
             .north, .south => {
                 if (match(win.frame.w, @divFloor(win_target.frame.w, 2))) {
@@ -324,7 +372,7 @@ fn moveWindow(dir_input: Direction, arena: *ArenaAllocator) !void {
             },
         };
     }
-
+    // No target
     if (win_north == null and win_south == null and // is maximized
         win_east == null and win_west == null) return moveToDisplay(arena, dir_input);
 
@@ -387,7 +435,6 @@ fn moveToDisplay(arena: *ArenaAllocator, dir_input: Direction) !void {
     };
     const stream = try yabaiUnchecked(.window, .{ id_target, "--insert", side_insert });
     defer stream.close();
-
     try yabai(.window, .{ "--display", dir_input, "--focus" });
     try checkStreamError(stream);
 }
@@ -474,7 +521,7 @@ fn yabai(comptime domain: Domain, args: anytype) !void {
 }
 
 fn yabaiUnchecked(comptime domain: Domain, args: anytype) !net.Stream {
-    var buf = comptime std.BoundedArray(u8, 128).fromSlice([_]u8{ 0, 0, 0, 0 } ++ @tagName(domain) ++ [_]u8{0}) catch unreachable;
+    var buf = std.BoundedArray(u8, 128).fromSlice([_]u8{ 0, 0, 0, 0 } ++ @tagName(domain) ++ [_]u8{0}) catch unreachable;
     inline for (args) |arg| {
         switch (@TypeOf(arg)) {
             Direction => buf.appendSliceAssumeCapacity(@tagName(arg)),
@@ -595,49 +642,6 @@ const Window = struct {
         }
     }
 };
-
-fn startService(username: []const u8, path_socket: []const u8) !void {
-    if (net.connectUnixSocket(path_socket) catch null) |s| {
-        s.close();
-        return log.info("y3 is already running, exiting...", .{});
-    }
-    fs.deleteFileAbsolute(path_socket) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => |e| return e,
-    };
-    const gpa = std.heap.c_allocator;
-    const agent_path = try fs.path.join(gpa, &.{ "/Users", username, "Library", "LaunchAgents", "y3.plist" });
-    defer gpa.free(agent_path);
-
-    _ = fs.openFileAbsolute(agent_path, .{ .mode = .read_only }) catch |err| switch (err) {
-        error.FileNotFound => {
-            const agent_file = try fs.createFileAbsolute(agent_path, .{});
-            defer agent_file.close();
-            try agent_file.writeAll(y3_plist);
-            log.info("installed y3 service: {s}", .{agent_path});
-        },
-        else => return log.err("failed to open y3.plist: {s}", .{@errorName(err)}),
-    };
-    var proc = std.process.Child.init(&.{ "launchctl", "load", agent_path }, gpa);
-    _ = try proc.spawnAndWait();
-    log.info("y3 service loaded...", .{});
-}
-
-fn stopService(username: []const u8, path_socket: []const u8) !void {
-    const gpa = std.heap.c_allocator;
-    const path_agent = try fs.path.join(gpa, &.{ "/Users", username, "Library", "LaunchAgents", "y3.plist" });
-    defer gpa.free(path_agent);
-
-    var proc = std.process.Child.init(&.{ "launchctl", "unload", path_agent }, gpa);
-    _ = try proc.spawnAndWait();
-    log.info("y3 service unloaded...", .{});
-    try fs.deleteFileAbsolute(path_socket);
-}
-
-fn restartService(username: []const u8, path_socket: []const u8) !void {
-    try stopService(username, path_socket);
-    try startService(username, path_socket);
-}
 
 const error_map = std.StaticStringMap(YabaiError).initComptime(.{
     .{ "could not locate a northward managed window.", error.WindowNorth },
