@@ -12,6 +12,8 @@ const net = std.net;
 const print = std.debug.print;
 const Timer = std.time.Timer;
 
+var path_yabai: []const u8 = undefined;
+
 const Command = enum(u8) {
     focus = 1,
     move,
@@ -39,12 +41,10 @@ const Domain = enum {
     query,
 };
 
-var path_yabai: []const u8 = undefined;
-
-const Payload = packed struct {
-    command: Command,
-    direction: Direction = 0,
+const Payload = extern struct {
     id_window: u32 = 0,
+    command: Command,
+    direction: Direction = .north,
     index_space: u8 = 0,
 };
 
@@ -59,28 +59,31 @@ pub fn main() !void {
     var buf_path: [64]u8 = undefined;
     const path_socket_y3 = try std.fmt.bufPrint(&buf_path, "/tmp/y3_{s}.socket", .{username});
 
-    var buf_cmd: [5]u8 = .{ @intFromEnum(command), 0, 0, 0, 0 };
+    // var buf_cmd: [5]u8 = .{ @intFromEnum(command), 0, 0, 0, 0 };
+    var payload: Payload = .{ .command = command };
     switch (command) {
+        .@"space-changed" => {},
         .@"window-focused", .@"window-created" => {
             const arg2 = args.next() orelse return log.err("missing window ID argument.", .{});
-            const id = std.fmt.parseUnsigned(u32, arg2, 10) catch |err| return log.err("invalid window id '{s}': {s}", .{ arg2, @errorName(err) });
-            buf_cmd[1..].* = @bitCast(id);
+            payload.id_window = std.fmt.parseUnsigned(u32, arg2, 10) catch |err| return log.err("invalid window id '{s}': {s}", .{ arg2, @errorName(err) });
+            // buf_cmd[1..].* = @bitCast(id);
         },
         .focus, .move => {
             const arg2 = args.next() orelse return log.err("missing direction argument", .{});
-            const dir = std.meta.stringToEnum(Direction, arg2) orelse return log.err("invalid direction: {s}", .{arg2});
-            buf_cmd[1] = @intFromEnum(dir);
+            payload.direction = std.meta.stringToEnum(Direction, arg2) orelse return log.err("invalid direction: {s}", .{arg2});
+            // buf_cmd[1] = @intFromEnum(dir);
         },
+        .stop => {},
         .run => return init(username, path_socket_y3),
         .@"start-service" => return startService(username, path_socket_y3),
         .@"stop-service" => return stopService(username, path_socket_y3),
         .@"restart-service" => return restartService(username, path_socket_y3),
-        .@"space-changed" => {},
-        .stop => {},
     }
     const stream = net.connectUnixSocket(path_socket_y3) catch |err| return log.err("failed to connect to y3 socket: {s}", .{@errorName(err)});
     defer stream.close();
-    try stream.writeAll(&buf_cmd);
+
+    var buf_payload: [8]u8 = @bitCast(payload);
+    try stream.writeAll(&buf_payload);
 }
 
 fn startService(username: []const u8, path_socket: []const u8) !void {
@@ -213,7 +216,8 @@ fn init(username: []const u8, path_socket_y3: []const u8) !void {
 fn coreLoop(arena: *ArenaAllocator, server: *net.Server, config: *const Config, id_win_focused_arg: ?u32) void {
     var id_win_focused: ?u32 = id_win_focused_arg;
     var id_win_other: ?u32 = null;
-    var buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
+    // var buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
+    var buf: [8]u8 = undefined;
 
     while (true) {
         defer _ = arena.reset(.{ .retain_with_limit = 1024 * 16 });
@@ -227,19 +231,20 @@ fn coreLoop(arena: *ArenaAllocator, server: *net.Server, config: *const Config, 
             log.err("failed to read socket stream: {s}", .{@errorName(err)});
             continue;
         };
-        const command: Command = @enumFromInt(buf[0]);
-        switch (command) {
+        const payload: Payload = @bitCast(buf);
+        // const command: Command = @enumFromInt(buf[0]);
+        switch (payload.command) {
             .focus => {
-                const dir: Direction = @enumFromInt(buf[1]);
-                focusWindow(dir) catch |err| {
-                    log.err("failed to 'focus window {s}': {s}", .{ @tagName(dir), @errorName(err) });
+                // const dir: Direction = @enumFromInt(buf[1]);
+                focusWindow(payload.direction) catch |err| {
+                    log.err("failed to 'focus window {s}': {s}", .{ @tagName(payload.direction), @errorName(err) });
                     if (builtin.mode == .Debug) std.debug.dumpStackTrace(@errorReturnTrace().?.*);
                 };
             },
             .move => {
-                const dir: Direction = @enumFromInt(buf[1]);
-                moveWindow(dir, arena) catch |err| {
-                    log.err("failed to 'move window {s}': {s}", .{ @tagName(dir), @errorName(err) });
+                // const dir: Direction = @enumFromInt(buf[1]);
+                moveWindow(payload.direction, arena) catch |err| {
+                    log.err("failed to 'move window {s}': {s}", .{ @tagName(payload.direction), @errorName(err) });
                     if (builtin.mode == .Debug) std.debug.dumpStackTrace(@errorReturnTrace().?.*);
                 };
             },
@@ -254,7 +259,8 @@ fn coreLoop(arena: *ArenaAllocator, server: *net.Server, config: *const Config, 
                 };
             },
             .@"window-created" => {
-                const id_win_created: u32 = @bitCast(buf[1..].*);
+                // const id_win_created: u32 = @bitCast(buf[1..].*);
+                const id_win_created: u32 = payload.id_window;
                 placeWindow(id_win_created, id_win_focused, id_win_other, config, arena) catch |err| {
                     log.err("failed to place created window {}: {s}", .{ id_win_created, @errorName(err) });
                     if (builtin.mode == .Debug) std.debug.dumpStackTrace(@errorReturnTrace().?.*);
@@ -263,10 +269,11 @@ fn coreLoop(arena: *ArenaAllocator, server: *net.Server, config: *const Config, 
             .@"window-focused" => {
                 // print("window focused\n", .{});
                 id_win_other = id_win_focused;
-                id_win_focused = @bitCast(buf[1..].*);
+                id_win_focused = payload.id_window;
+                // id_win_focused = @bitCast(buf[1..].*);
             },
             .stop => break,
-            else => log.err("unsupported command sent to y3 server: {s}", .{@tagName(command)}),
+            else => |cmd| log.err("unsupported command sent to y3 server: {s}", .{@tagName(cmd)}),
         }
     }
 }
