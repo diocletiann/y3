@@ -6,6 +6,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const approxEqAbs = std.math.approxEqAbs;
 const fmt = std.fmt;
 const fs = std.fs;
+const json = std.json;
 const log = std.log;
 const mem = std.mem;
 const meta = std.meta;
@@ -180,11 +181,11 @@ fn init(username: []const u8, path_socket_y3: []const u8) !void {
 }
 
 const Config = struct {
-    allow_list: std.json.ArrayHashMap(?[]const []const u8),
+    allow_list: json.ArrayHashMap(?[]const []const u8),
     layout: enum { bsp, manual, two_columns },
     placement: enum { focused_window, other_window },
 
-    fn load(gpa: Allocator, username: []const u8) !std.json.Parsed(Config) {
+    fn load(gpa: Allocator, username: []const u8) !json.Parsed(Config) {
         const path = try std.fs.path.join(gpa, &.{ "/Users", username, ".config", "y3", "config.json" });
         defer gpa.free(path);
         const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch |err| {
@@ -193,7 +194,7 @@ const Config = struct {
         };
         const data = try file.readToEndAlloc(gpa, 1024);
         defer gpa.free(data);
-        return std.json.parseFromSlice(Config, gpa, data, .{ .allocate = .alloc_always });
+        return json.parseFromSlice(Config, gpa, data, .{ .allocate = .alloc_always });
     }
 };
 
@@ -215,7 +216,13 @@ fn spaceChanged(
     };
 }
 
-fn placeWindow(id_win_created: u32, id_win_focused: ?u32, id_win_recent: ?u32, config: *const Config, arena: *ArenaAllocator) !void {
+fn placeWindow(
+    id_win_created: u32,
+    id_win_focused: ?u32,
+    id_win_recent: ?u32,
+    config: *const Config,
+    arena: *ArenaAllocator,
+) !void {
     const WindowLocal = struct {
         app: []const u8,
         title: []const u8,
@@ -247,7 +254,7 @@ fn placeWindow(id_win_created: u32, id_win_focused: ?u32, id_win_recent: ?u32, c
         const stream = try yabaiUnchecked(.window, .{ space.@"first-window", "--insert", Direction.east });
         defer stream.close();
         try float(id_win_created);
-        return checkStreamError(stream);
+        return handleStream(stream);
     }
     const id_win_prev = (if (id_win_focused != id_win_created) id_win_focused else id_win_recent) orelse return error.WindowOther;
     const id_win_target = switch (config.placement) {
@@ -408,7 +415,7 @@ fn moveToDisplay(arena: *ArenaAllocator, dir_input: Direction) !void {
     const stream = try yabaiUnchecked(.window, .{ id_target, "--insert", side_insert });
     defer stream.close();
     try yabai(.window, .{ "--display", dir_input, "--focus" });
-    try checkStreamError(stream);
+    try handleStream(stream);
 }
 
 const Argument = union(enum) {
@@ -434,7 +441,7 @@ fn insertWarp(id_source: u32, id_target: u32, side_insert: Direction, dir_warp: 
     const stream = try yabaiUnchecked(.window, .{ id_target, "--insert", side_insert });
     defer stream.close();
     try yabai(.window, .{ id_source, "--warp", dir_warp });
-    try checkStreamError(stream);
+    try handleStream(stream);
 }
 
 fn float(id_win: u32) !void {
@@ -465,13 +472,14 @@ fn query(
         fields_string = fields_string ++ field.name;
         if (i < count_fields - 1) fields_string = fields_string ++ ",";
     }
-    const stream = try yabaiUnchecked(.query, .{"--" ++ @as([]const u8, @tagName(cmd))} ++ .{@as([]const u8, fields_string)} ++ args);
+    const stream = try yabaiUnchecked(.query, .{"--" ++ @tagName(cmd)} ++ .{fields_string} ++ args);
     defer stream.close();
 
     const arena_alloc = arena.allocator();
-    const buf = try stream.reader().readAllAlloc(arena_alloc, 8192);
-    var parsed = std.json.parseFromSliceLeaky(Parsed, arena_alloc, buf, .{ .ignore_unknown_fields = true }) catch |err| {
-        try findSendError(buf);
+    const buf = try stream.reader().readAllAlloc(arena_alloc, 16 * 1024);
+
+    var parsed = json.parseFromSliceLeaky(Parsed, arena_alloc, buf, .{ .ignore_unknown_fields = true }) catch |err| {
+        try checkServerError(buf);
         return err;
     };
     if (@hasField(Parsed, "frame")) {
@@ -481,14 +489,12 @@ fn query(
         }
     } else if (@typeInfo(Parsed) == .Pointer) {
         const type_child = @typeInfo(Parsed).Pointer.child;
-
         if (@hasField(type_child, "frame")) {
-            if (@hasField(meta.FieldType(type_child, .frame), "x2") and @hasField(meta.FieldType(type_child, .frame), "y2")) {
+            if (@hasField(meta.FieldType(type_child, .frame), "x2") and @hasField(meta.FieldType(type_child, .frame), "y2"))
                 for (parsed) |*p| {
                     p.*.frame.x2 = p.frame.x + p.frame.w;
                     p.*.frame.y2 = p.frame.y + p.frame.h;
-                }
-            }
+                };
         }
     }
     return parsed;
@@ -497,7 +503,7 @@ fn query(
 fn yabai(comptime domain: Domain, args: anytype) !void {
     const stream = try yabaiUnchecked(domain, args);
     defer stream.close();
-    try checkStreamError(stream);
+    try handleStream(stream);
 }
 
 fn yabaiUnchecked(comptime domain: Domain, args: anytype) !net.Stream {
@@ -530,13 +536,13 @@ fn yabaiUnchecked(comptime domain: Domain, args: anytype) !net.Stream {
     return stream;
 }
 
-fn checkStreamError(stream: net.Stream) !void {
+fn handleStream(stream: net.Stream) !void {
     var buf: [128]u8 = undefined;
     const len = try stream.readAll(&buf);
-    if (len > 0) try findSendError(buf[0..len]);
+    if (len > 0) try checkServerError(buf[0..len]);
 }
 
-fn findSendError(buf: []const u8) !void {
+fn checkServerError(buf: []const u8) !void {
     if (buf[0] == 7) return error_map.get(buf[1 .. buf.len - 1]) orelse {
         defer log.err("{s} [yabai reply]", .{buf[1 .. buf.len - 1]});
         if (mem.indexOf(u8, buf, "unknown command")) |_| return error.UnknownCommand;
