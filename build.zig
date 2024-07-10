@@ -39,10 +39,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .strip = optimize != .Debug,
-        // .linkage = .static,
+        .omit_frame_pointer = optimize != .Debug,
         // .sanitize_thread = optimize == .Debug,
-        // .omit_frame_pointer = optimize == .Debug,
     });
+    // const llvm_path: std.Build.LazyPath = .{ .cwd_relative = "/opt/homebrew/opt/llvm/lib" };
+    // exe.addLibraryPath(llvm_path);
+    // exe.linkSystemLibrary("asan");
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
