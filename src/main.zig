@@ -15,8 +15,6 @@ const print = std.debug.print;
 const Timer = std.time.Timer;
 const Type = std.builtin.Type;
 
-var path_socket_yabai: []const u8 = undefined;
-
 const Direction = enum(u8) {
     north,
     south,
@@ -39,13 +37,13 @@ const Command = union(enum) {
     @"window-focused": u32,
     @"start-service",
     @"stop-service",
+    @"restart-service",
     run,
 };
 
 pub fn main() !void {
     var args = std.process.args();
     _ = args.skip();
-
     const arg1 = args.next() orelse return log.err("missing command argument.", .{});
     const command_enum = meta.stringToEnum(meta.FieldEnum(Command), arg1) orelse return log.err("invalid action: {s}", .{arg1});
 
@@ -68,6 +66,7 @@ pub fn main() !void {
             .run => return init(username, path_socket_y3),
             .@"start-service" => return startService(username, path_socket_y3),
             .@"stop-service" => return stopService(username, path_socket_y3),
+            .@"restart-service" => return restartService(username, path_socket_y3),
         },
     };
     if (args.next()) |_| return log.err("too many arguments", .{});
@@ -75,6 +74,8 @@ pub fn main() !void {
     defer stream.close();
     try stream.writeAll(mem.asBytes(&command));
 }
+
+var path_socket_yabai: []const u8 = undefined;
 
 fn init(username: []const u8, path_socket_y3: []const u8) !void {
     errdefer log.err("failed to initialize y3 service", .{});
@@ -143,7 +144,6 @@ fn init(username: []const u8, path_socket_y3: []const u8) !void {
 
     while (true) {
         errdefer comptime unreachable;
-
         defer _ = arena.reset(.{ .retain_with_limit = 1024 * 16 });
         const conn = server.accept() catch |err| {
             log.err("failed to accept socket connection: {s}", .{@errorName(err)});
@@ -161,12 +161,12 @@ fn init(username: []const u8, path_socket_y3: []const u8) !void {
                 .focus => focusWindow(value),
                 .move => moveWindow(value, &arena),
                 .@"window-focused" => {
-                    // print("window focused: {}\n", .{value});
                     id_win_recent = id_win_focused;
                     id_win_focused = value;
                 },
                 .@"window-created" => placeWindow(value, id_win_focused, id_win_recent, &config.value, &arena),
                 .@"space-focused" => {
+                    // TODO
                     // print("space changed: {}\n", .{value});
                     // indexes.put(value.i)
                     // break :blk spaceChanged(arena, &indexes, id_win_focused);
@@ -198,12 +198,7 @@ const Config = struct {
     }
 };
 
-fn spaceChanged(
-    arena: *ArenaAllocator,
-    // indexes: *std.AutoArrayHashMap(u8, u8),
-    // id_win_focused: ?u32,
-) !void {
-    // print("space changed\n", .{});
+fn spaceChanged(arena: *ArenaAllocator) !void {
     const WindowLocal = struct { id: u32, title: []const u8 };
     const windows = query(arena, []WindowLocal, .windows, .{"--space"}) catch |err| {
         log.err("focused window query failed, {}", .{err});
@@ -361,7 +356,7 @@ fn moveWindow(dir_input: Direction, arena: *ArenaAllocator) !void {
     if (win_north == null and win_south == null and // is maximized
         win_east == null and win_west == null) return moveToDisplay(arena, dir_input);
 
-    if (win_north == null and win_south == null) return switch (dir_input) { // is full height
+    if (win_north == null and win_south == null) return switch (dir_input) {
         .east, .west => return moveToDisplay(arena, dir_input),
         .north, .south => {
             if (win_east == null) // is right
@@ -379,9 +374,9 @@ fn moveWindow(dir_input: Direction, arena: *ArenaAllocator) !void {
                 if (win_north.?.isFullWidth(windows, dir_input)) return insertWarp(win.id, win_north.?.id, dir_input, .north);
         },
     };
-    if (win_north == null) // is top
+    if (win_north == null)
         return if (match(win.frame.w, win_south.?.frame.w)) insertWarp(win.id, win_south.?.id, dir_input, .south);
-    if (win_south == null) // is bottom
+    if (win_south == null)
         return if (match(win.frame.w, win_north.?.frame.w)) insertWarp(win.id, win_north.?.id, dir_input, .north);
 }
 
@@ -507,9 +502,7 @@ fn yabai(comptime domain: Domain, args: anytype) !void {
 }
 
 fn yabaiUnchecked(comptime domain: Domain, args: anytype) !net.Stream {
-    var buf = std.BoundedArray(u8, 128)
-        .fromSlice([_]u8{ 0, 0, 0, 0 } ++ @as([]const u8, @tagName(domain)) ++ [_]u8{0}) catch unreachable;
-
+    var buf = std.BoundedArray(u8, 128).fromSlice([_]u8{ 0, 0, 0, 0 } ++ @tagName(domain) ++ [_]u8{0}) catch unreachable;
     inline for (args) |arg| {
         switch (@TypeOf(arg)) {
             Argument => switch (arg) {
