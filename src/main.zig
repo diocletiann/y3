@@ -32,7 +32,7 @@ const Domain = enum {
 const Command = union(enum) {
     focus: Direction,
     move: Direction,
-    @"space-focused": u32,
+    @"space-changed": u32,
     @"window-created": u32,
     @"window-focused": u32,
     @"start-service",
@@ -53,7 +53,7 @@ pub fn main() !void {
 
     const command = switch (command_enum) {
         inline else => |tag_comptime| switch (tag_comptime) {
-            .@"space-focused", .@"window-focused", .@"window-created" => |tag| blk: {
+            .@"space-changed", .@"window-focused", .@"window-created" => |tag| blk: {
                 const arg2 = args.next() orelse return log.err("missing {s} ID/index argument.", .{@tagName(tag)});
                 const id = fmt.parseUnsigned(u32, arg2, 10) catch |err| return log.err("invalid window id '{s}': {}", .{ arg2, err });
                 break :blk @unionInit(Command, @tagName(tag), id);
@@ -120,6 +120,7 @@ fn init(username: []const u8, path_socket_y3: []const u8) !void {
     //     std.time.sleep(50 * std.time.ns_per_ms);
     //     try focus(.space, "next");
     // }
+
     const WindowLocal = struct {
         id: u32,
         @"has-focus": bool,
@@ -137,21 +138,24 @@ fn init(username: []const u8, path_socket_y3: []const u8) !void {
             try float(w.id);
         }
     }
-    _ = arena.reset(.free_all);
-
     var id_win_recent: ?u32 = null;
+    var space_current: u8 = (try query(&arena, struct { index: u8 }, .spaces, .{"--space"})).index;
     var buf: [@sizeOf(Command)]u8 = undefined;
+    var last_focused_in_space = std.AutoArrayHashMap(u32, u32).init(gpa_alloc);
 
+    _ = arena.reset(.free_all);
     while (true) {
-        errdefer comptime unreachable;
         defer _ = arena.reset(.{ .retain_with_limit = 1024 * 16 });
+        errdefer comptime unreachable;
+
         const conn = server.accept() catch |err| {
             log.err("failed to accept socket connection: {s}", .{@errorName(err)});
             continue;
         };
         defer conn.stream.close();
+
         _ = conn.stream.readAll(&buf) catch |err| {
-            log.err("failed to read socket stream: {s}", .{@errorName(err)});
+            log.err("error reading socket stream: {s}", .{@errorName(err)});
             continue;
         };
         const payload = mem.bytesToValue(Command, &buf);
@@ -160,16 +164,34 @@ fn init(username: []const u8, path_socket_y3: []const u8) !void {
             inline else => |value, tag| switch (tag) {
                 .focus => focusWindow(value),
                 .move => moveWindow(value, &arena),
+                .@"space-changed" => blk: {
+                    print("CHANGED: {}\n", .{value});
+
+                    space_current = @intCast(value);
+                    const id_last_focused_in_space = last_focused_in_space.get(value) orelse continue;
+
+                    if (id_win_focused != id_last_focused_in_space)
+                        break :blk focus(.window, .{ .id = id_last_focused_in_space });
+                },
                 .@"window-focused" => {
+                    print("FOCUSED: {}\n", .{value});
+
                     id_win_recent = id_win_focused;
                     id_win_focused = value;
+
+                    const space_win_focused = (query(&arena, struct { space: u8 }, .windows, .{"--window"}) catch |err| {
+                        log.err("{}", .{err});
+                        continue;
+                    }).space;
+
+                    if (space_win_focused == space_current) {
+                        last_focused_in_space.put(space_current, value) catch |err| log.err("window focused - last focused map put: {}", .{err});
+                        print("put {}:{}\n", .{ space_current, value });
+                    }
                 },
-                .@"window-created" => placeWindow(value, id_win_focused, id_win_recent, &config.value, &arena),
-                .@"space-focused" => {
-                    // TODO
-                    // print("space changed: {}\n", .{value});
-                    // indexes.put(value.i)
-                    // break :blk spaceChanged(arena, &indexes, id_win_focused);
+                .@"window-created" => blk: {
+                    print("created: {d}\n", .{value});
+                    break :blk placeWindow(value, id_win_focused, id_win_recent, &config.value, &arena);
                 },
                 else => |cmd| log.err("unsupported command: {s}", .{@tagName(cmd)}),
             },
@@ -177,6 +199,7 @@ fn init(username: []const u8, path_socket_y3: []const u8) !void {
             log.err("command {s} {} failed: {}\n", .{ @tagName(payload), payload, err });
             if (builtin.mode == .Debug) std.debug.dumpStackTrace(@errorReturnTrace().?.*);
         };
+        print("             {any} {any}\n", .{ last_focused_in_space.keys(), last_focused_in_space.values() });
     }
 }
 
@@ -198,18 +221,19 @@ const Config = struct {
     }
 };
 
-fn spaceChanged(arena: *ArenaAllocator) !void {
-    const WindowLocal = struct { id: u32, title: []const u8 };
-    const windows = query(arena, []WindowLocal, .windows, .{"--space"}) catch |err| {
-        log.err("focused window query failed, {}", .{err});
-        return err;
-    };
-    if (windows.len > 1) for (windows) |win| {
-        log.debug("title: {s}", .{win.title});
-        if (mem.eql(u8, win.title, "Picture-in-Picture"))
-            focus(.window, "last") catch |err| log.err("focus other failed, {}", .{err});
-    };
-}
+// fn spaceChanged(arena: *ArenaAllocator) !void {
+//     _ = arena; // autofix
+//     // const WindowLocal = struct { id: u32, title: []const u8 };
+//     // const windows = query(arena, []WindowLocal, .windows, .{"--space"}) catch |err| {
+//     //     log.err("focused window query failed, {}", .{err});
+//     //     return err;
+//     // };
+//     // if (windows.len > 1) for (windows) |win| {
+//     //     log.debug("title: {s}", .{win.title});
+//     //     if (mem.eql(u8, win.title, "Picture-in-Picture"))
+//     //         focus(.window, "last") catch |err| log.err("focus other failed, {}", .{err});
+//     // };
+// }
 
 fn placeWindow(
     id_win_created: u32,
