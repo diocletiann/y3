@@ -140,10 +140,10 @@ fn init(username: []const u8, path_socket_y3: []const u8) !void {
     }
     var id_win_recent: ?u32 = null;
     var space_current: u8 = (try query(&arena, struct { index: u8 }, .spaces, .{"--space"})).index;
-    var buf: [@sizeOf(Command)]u8 = undefined;
-    var last_focused_in_space = std.AutoArrayHashMap(u32, u32).init(gpa_alloc);
-
+    var last_focused_in_space = std.AutoHashMap(u8, u32).init(gpa_alloc);
     _ = arena.reset(.free_all);
+
+    var buf: [@sizeOf(Command)]u8 = undefined;
     while (true) {
         defer _ = arena.reset(.{ .retain_with_limit = 1024 * 16 });
         errdefer comptime unreachable;
@@ -165,41 +165,32 @@ fn init(username: []const u8, path_socket_y3: []const u8) !void {
                 .focus => focusWindow(value),
                 .move => moveWindow(value, &arena),
                 .@"space-changed" => blk: {
-                    print("CHANGED: {}\n", .{value});
-
                     space_current = @intCast(value);
-                    const id_last_focused_in_space = last_focused_in_space.get(value) orelse continue;
+                    const id_last_focused_in_space = last_focused_in_space.get(@intCast(value)) orelse continue;
 
                     if (id_win_focused != id_last_focused_in_space)
                         break :blk focus(.window, .{ .id = id_last_focused_in_space });
                 },
                 .@"window-focused" => {
-                    print("FOCUSED: {}\n", .{value});
-
                     id_win_recent = id_win_focused;
                     id_win_focused = value;
 
                     const space_win_focused = (query(&arena, struct { space: u8 }, .windows, .{"--window"}) catch |err| {
-                        log.err("{}", .{err});
+                        log.err("win focused query failed: {}", .{err});
                         continue;
                     }).space;
 
-                    if (space_win_focused == space_current) {
-                        last_focused_in_space.put(space_current, value) catch |err| log.err("window focused - last focused map put: {}", .{err});
-                        print("put {}:{}\n", .{ space_current, value });
-                    }
+                    if (space_win_focused == space_current) last_focused_in_space.put(space_current, value) catch |err|
+                        log.err("window focused - last focused map put: {}", .{err});
                 },
-                .@"window-created" => blk: {
-                    print("created: {d}\n", .{value});
-                    break :blk placeWindow(value, id_win_focused, id_win_recent, &config.value, &arena);
-                },
+                .@"window-created" => placeWindow(value, id_win_focused, id_win_recent, &config.value, &arena),
+
                 else => |cmd| log.err("unsupported command: {s}", .{@tagName(cmd)}),
             },
         } catch |err| {
             log.err("command {s} {} failed: {}\n", .{ @tagName(payload), payload, err });
             if (builtin.mode == .Debug) std.debug.dumpStackTrace(@errorReturnTrace().?.*);
         };
-        print("             {any} {any}\n", .{ last_focused_in_space.keys(), last_focused_in_space.values() });
     }
 }
 
@@ -220,20 +211,6 @@ const Config = struct {
         return json.parseFromSlice(Config, gpa, data, .{ .allocate = .alloc_always });
     }
 };
-
-// fn spaceChanged(arena: *ArenaAllocator) !void {
-//     _ = arena; // autofix
-//     // const WindowLocal = struct { id: u32, title: []const u8 };
-//     // const windows = query(arena, []WindowLocal, .windows, .{"--space"}) catch |err| {
-//     //     log.err("focused window query failed, {}", .{err});
-//     //     return err;
-//     // };
-//     // if (windows.len > 1) for (windows) |win| {
-//     //     log.debug("title: {s}", .{win.title});
-//     //     if (mem.eql(u8, win.title, "Picture-in-Picture"))
-//     //         focus(.window, "last") catch |err| log.err("focus other failed, {}", .{err});
-//     // };
-// }
 
 fn placeWindow(
     id_win_created: u32,
